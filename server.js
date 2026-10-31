@@ -3,11 +3,15 @@ const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const cors = require('cors');
+const { hash, limitAttempts, recoveryMailer, processResetJobs, Attempt, ResetJob } = require('./security');
 
 const UserSchema = new mongoose.Schema({
     name: { type: String, required: true },
     email: { type: String, required: true, unique: true },
     password: { type: String, required: true, select: false },
+    sessionVersion: { type: Number, default: 0 },
+    resetTokenHash: { type: String, select: false },
+    resetTokenExpiresAt: { type: Date, select: false },
     balance: { type: Number, default: 0 },
     vipLevel: { type: Number, default: 1, min: 1, max: 3600 },
     taskCompletedToday: { type: Boolean, default: false },
@@ -36,12 +40,15 @@ function taskDay(date, timeZone) {
 
 function createApp({ secret = process.env.JWT_SECRET,
     timeZone = process.env.TASK_TIMEZONE || 'America/Mexico_City',
-    clock = () => new Date() } = {}) {
+    clock = () => new Date(), sendReset = recoveryMailer(),
+    trustProxyHops = Number(process.env.TRUST_PROXY_HOPS || 0) } = {}) {
     if (typeof secret !== 'string' || Buffer.byteLength(secret) < 32) {
         throw new Error('JWT_SECRET debe contener al menos 32 bytes.');
     }
     taskDay(clock(), timeZone); // Validar la zona horaria al iniciar.
     const app = express();
+    if (!Number.isInteger(trustProxyHops) || trustProxyHops < 0 || trustProxyHops > 1) throw new Error('TRUST_PROXY_HOPS debe ser 0 o 1.');
+    app.set('trust proxy', trustProxyHops);
     app.disable('x-powered-by');
     const origins = (process.env.CORS_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
     app.use(cors({ origin: (origin, done) => done(null, !origin || origins.length === 0 || origins.includes(origin)) }));
@@ -79,6 +86,7 @@ function createApp({ secret = process.env.JWT_SECRET,
         }
         const user = await User.findById(payload.sub);
         if (!user) return res.status(401).json({ error: 'Sesión inválida.' });
+        if ((payload.ver ?? 0) !== (user.sessionVersion ?? 0)) return res.status(401).json({ error: 'La contraseña cambió. Inicia sesión nuevamente.' });
         if (user.isBlocked) return res.status(403).json({ error: 'Tu cuenta está bloqueada.' });
         req.user = user;
         next();
@@ -88,7 +96,7 @@ function createApp({ secret = process.env.JWT_SECRET,
         const connected = mongoose.connection.readyState === 1;
         res.status(connected ? 200 : 503).json({ status: connected ? 'ok' : 'unavailable' });
     });
-    app.post('/api/register', asyncRoute(async (req, res) => {
+    app.post('/api/register', limitAttempts('register-ip', 10, { clock }), asyncRoute(async (req, res) => {
         const { name, password } = req.body || {};
         const email = emailValue(req.body?.email);
         if (typeof name !== 'string' || !name.trim() || name.trim().length > 100 || !validEmail(email) || !validPassword(password)) {
@@ -100,7 +108,7 @@ function createApp({ secret = process.env.JWT_SECRET,
         const user = await User.create({ name: name.trim(), email, password: await bcrypt.hash(password, 12) });
         res.status(201).json({ message: 'Usuario registrado con éxito', user: publicUser(user) });
     }));
-    app.post('/api/login', asyncRoute(async (req, res) => {
+    app.post('/api/login', limitAttempts('login-ip', 30, { clock }), limitAttempts('login-account', 10, { account: true, clock }), asyncRoute(async (req, res) => {
         const email = emailValue(req.body?.email);
         const password = req.body?.password;
         if (!validEmail(email) || typeof password !== 'string' || !password || Buffer.byteLength(password) > 72) {
@@ -111,10 +119,35 @@ function createApp({ secret = process.env.JWT_SECRET,
             return res.status(401).json({ error: 'Credenciales inválidas.' });
         }
         if (user.isBlocked) return res.status(403).json({ error: 'Tu cuenta está bloqueada.' });
-        const token = jwt.sign({}, secret, { ...tokenOptions, subject: String(user._id), expiresIn: '24h' });
+        const token = jwt.sign({ ver: user.sessionVersion ?? 0 }, secret, { ...tokenOptions, subject: String(user._id), expiresIn: '24h' });
         res.json({ token, tokenType: 'Bearer', expiresIn: 86400, role: user.role, user: publicUser(user) });
     }));
     app.get('/api/me', requireAuth, (req, res) => res.json({ user: publicUser(req.user) }));
+
+    app.post('/api/forgot-password', limitAttempts('forgot-ip', 10, { clock }), limitAttempts('forgot-account', 3, { account: true, clock }), asyncRoute(async (req, res) => {
+        const email = emailValue(req.body?.email);
+        if (!validEmail(email)) return res.status(400).json({ error: 'Indica un correo válido.' });
+        if (!sendReset) return res.status(503).json({ error: 'La recuperación por correo aún no está configurada.' });
+        // Encolar todos los correos validos produce la misma respuesta sin revelar cuentas.
+        await ResetJob.create({ email, nextAttemptAt: clock(), expiresAt: new Date(clock().getTime()+3600000) });
+        res.status(202).json({ message: 'Si el correo corresponde a una cuenta habilitada, recibirás un enlace para restablecer tu contraseña.' });
+    }));
+    app.post('/api/reset-password', limitAttempts('reset-ip', 20, { clock }), asyncRoute(async (req, res) => {
+        const { token, password } = req.body || {};
+        if (typeof token !== 'string' || !/^[a-f0-9]{64}$/.test(token) || !validPassword(password)) {
+            return res.status(400).json({ error: 'Indica un enlace válido y una contraseña de al menos 8 caracteres y hasta 72 bytes.' });
+        }
+        const filter = { resetTokenHash: hash(token), resetTokenExpiresAt: { $gt: clock() }, isBlocked: false };
+        if (!await User.exists(filter)) return res.status(400).json({ error: 'El enlace no es válido o ya venció.' });
+        const passwordHash = await bcrypt.hash(password, 12);
+        // Consumir enlace, cambiar clave e invalidar sesiones en una sola operacion.
+        const result = await User.updateOne(filter, {
+            $set: { password: passwordHash }, $inc: { sessionVersion: 1 },
+            $unset: { resetTokenHash: '', resetTokenExpiresAt: '' }
+        });
+        if (!result.modifiedCount) return res.status(400).json({ error: 'El enlace no es válido o ya venció.' });
+        res.json({ message: 'Contraseña actualizada. Inicia sesión con tu nueva contraseña.' });
+    }));
 
     app.post('/api/complete-task', requireAuth, asyncRoute(async (req, res) => {
         if (req.body?.userId !== undefined) {
@@ -193,10 +226,22 @@ async function start() {
     if (!process.env.MONGO_URI) throw new Error('Falta configurar MONGO_URI.');
     await mongoose.connect(process.env.MONGO_URI, { serverSelectionTimeoutMS: 15000 });
     await User.init();
+    await Promise.all([Attempt.init(), ResetJob.init()]);
     await migrateLegacyTasks(taskDay(new Date(), process.env.TASK_TIMEZONE || 'America/Mexico_City'));
     console.log('Conectado exitosamente a MongoDB');
     const server = app.listen(process.env.PORT || 3000, '0.0.0.0', () => console.log('Servidor Backend iniciado'));
+    const sendReset = recoveryMailer();
+    let processing = false;
+    const resetTimer = sendReset ? setInterval(async () => {
+        if (processing) return;
+        processing = true;
+        try { await processResetJobs({ User, sendReset }); }
+        catch { console.error('No se pudo procesar la cola de recuperación.'); }
+        finally { processing = false; }
+    }, 2000) : null;
+    resetTimer?.unref();
     const shutdown = () => {
+        if (resetTimer) clearInterval(resetTimer);
         const timer = setTimeout(() => process.exit(1), 25000);
         timer.unref();
         server.close(async () => { await mongoose.disconnect(); clearTimeout(timer); process.exit(0); });
